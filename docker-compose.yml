@@ -1,0 +1,30 @@
+services:
+  # The Database Service
+  db:
+    image: postgres:15-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASS}
+      POSTGRES_DB: strava_bot_db
+    volumes:
+      - ./pg_data:/var/lib/postgresql/data
+    networks:
+      - bot_net
+
+  # The Python Bot Service
+  app:
+    build: ./app
+    restart: always
+    depends_on:
+      - db
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${DB_USER}:${DB_PASS}@db:5432/strava_bot_db
+    networks:
+      - bot_net
+
+networks:
+  bot_net:
+    driver: bridge

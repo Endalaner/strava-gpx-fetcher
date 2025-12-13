@@ -1,0 +1,8 @@
+aiogram==3.1.1
+aiohttp==3.8.6
+sqlalchemy==2.0.23
+asyncpg==0.29.0
+python-dotenv==1.0.0
+transliterate==1.10.2
+APScheduler==3.10.4
+polyline==2.0.0
