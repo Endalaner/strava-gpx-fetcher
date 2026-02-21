@@ -141,8 +141,12 @@ class StravaService:
                         except Exception as e:
                             print(f"Polyline Error: {e}")
                     
+                elif resp.status == 403:
+                    raise Exception("Route is private (403)")
                 elif resp.status == 404:
-                    raise Exception("Route Private or Deleted")
+                    raise Exception("Route not found (404)")
+                else:
+                    raise Exception(f"Route fetch failed ({resp.status})")
 
             # 3. Download GPX
             # Also extract Lat/Lon from Polyline if available (needed for Weather)
@@ -175,5 +179,8 @@ class StravaService:
                         "lat": start_lat,
                         "lon": start_lon
                     }
+                 elif resp.status in (403, 404):
+                    raise Exception(f"GPX download blocked ({resp.status})")
                  else:
                     raise Exception(f"GPX Download Failed: {resp.status}")
+

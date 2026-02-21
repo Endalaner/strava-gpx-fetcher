@@ -58,41 +58,63 @@ async def update_logger(update: types.Update, bot: Bot):
 @dp.message(F.text.contains("strava"))
 async def link_handler(message: types.Message):
     logger.info("Triggered link_handler")
+
+    # Extract all Strava URLs from the message
+    strava_url_pattern = r'https?://(?:www\.)?(?:strava\.com|strava\.app\.link)/\S+'
+    urls = re.findall(strava_url_pattern, message.text)
+
+    if not urls:
+        return  # No valid Strava URLs found, silently skip
+
     await bot.send_chat_action(message.chat.id, action="upload_document")
     status = await message.reply("🔄 Обрабатываю...")
-    
-    try:
-        # returns dict: data, filename, name, distance, elevation, url, start_time, strava_event_id
-        result = await strava_service.get_gpx(message.text)
-        print(f"DEBUG: Result type: {type(result)}")
-        
-        caption = (
-            f"🚴 <b>{result['name']}</b>\n"
-            f"📏 {result['distance']:.2f} km | ⛰️ {int(result['elevation'])} m\n"
-            f"🔗 <a href='{result['url']}'>Страva Маршрут</a>"
-        )
-        
-        # Add "Announce" button if it's a group event with a start time
-        reply_markup = None
-        if result.get('start_time') and result.get('strava_event_id'):
-            reply_markup = UriChanUI.manual_announce_keyboard(result['strava_event_id'])
 
-        await message.reply_document(
-            document=BufferedInputFile(result['data'], filename=result['filename']),
-            caption=caption,
-            parse_mode="HTML",
-            reply_markup=reply_markup
-        )
+    processed = 0
+    errors = []
+
+    for url in urls:
+        try:
+            result = await strava_service.get_gpx(url)
+
+            caption = (
+                f"🚴 <b>{result['name']}</b>\n"
+                f"📏 {result['distance']:.2f} km | ⛰️ {int(result['elevation'])} m\n"
+                f"🔗 <a href='{result['url']}'>Страva Маршрут</a>"
+            )
+
+            # Add "Announce" button if it's a group event with a start time
+            reply_markup = None
+            if result.get('start_time') and result.get('strava_event_id'):
+                reply_markup = UriChanUI.manual_announce_keyboard(result['strava_event_id'])
+
+            await message.reply_document(
+                document=BufferedInputFile(result['data'], filename=result['filename']),
+                caption=caption,
+                parse_mode="HTML",
+                reply_markup=reply_markup
+            )
+            processed += 1
+
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Error processing Strava URL '{url}': {error_msg}")
+            if "403" in error_msg or "private" in error_msg.lower():
+                errors.append(f"🔒 Секретный маршрут! Кто-то прячет свои тропы 🐗")
+            elif "404" in error_msg:
+                errors.append(f"🔍 Маршрут не найден — может, его удалили?")
+            elif "Event not found" in error_msg:
+                errors.append(f"❌ Ивент не найден: {url}")
+            else:
+                errors.append(f"❌ {error_msg}")
+
+    # Clean up status message
+    if processed > 0 and not errors:
         await status.delete()
-            
-    except Exception as e:
-        error_msg = str(e)
-        if "404" in error_msg:
-            await status.edit_text("❌ Маршрут недоступен. Проверь настройки приватности.")
-        elif "Event not found" in error_msg:
-            await status.edit_text("❌ Ивент не найден или к нему не привязан маршрут.")
-        else:
-            await status.edit_text(f"❌ Ошибка: {error_msg}")
+    elif errors:
+        await status.edit_text("\n".join(errors))
+    else:
+        await status.edit_text("❌ Не удалось обработать ни одной ссылки.")
+
 
 @dp.callback_query(F.data.startswith("announce:"))
 async def announce_ride(callback: CallbackQuery):
