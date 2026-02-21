@@ -1,30 +1,63 @@
 import asyncio
 import os
 import re
+import logging
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import BufferedInputFile, CallbackQuery
+from aiogram.filters import Command
 from sqlalchemy import select, delete
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from database import init_db, async_session, Ride, RideParticipant, RideStatus, ParticipantStatus
-from database import init_db, async_session, Ride, RideParticipant, RideStatus, ParticipantStatus
 from strava import StravaService
-from scheduler import scheduler, schedule_ride_jobs
+from scheduler import scheduler, schedule_ride_jobs, schedule_weekend_weather_job, send_weekend_weather_broadcast
 from ui import UriChanUI
 from weather import weather_service
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_REFRESH_TOKEN = os.getenv("STRAVA_ADMIN_REFRESH_TOKEN")
+
+# Relay / Megaphone config
+TELEGRAM_GROUP_CHAT_ID = os.getenv("TELEGRAM_GROUP_CHAT_ID")
+BOT_RELAY_ALLOWED_USERS = {
+    int(uid.strip())
+    for uid in os.getenv("BOT_RELAY_ALLOWED_USERS", "").split(",")
+    if uid.strip().isdigit()
+}
+BOT_RELAY_MODE = os.getenv("BOT_RELAY_MODE", "command")  # "command" or "passthrough"
 
 strava_service = StravaService(refresh_token=ADMIN_REFRESH_TOKEN)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+# --- Middlewares ---
+
+@dp.update()
+async def update_logger(update: types.Update, bot: Bot):
+    if update.message:
+        logger.info(f">>> MSR RECV from {update.message.from_user.id}: '{update.message.text}'")
+    elif update.callback_query:
+        logger.info(f">>> CB RECV from {update.callback_query.from_user.id}: '{update.callback_query.data}'")
+    
+    # In aiogram 3, we don't return anything from update handlers if we want them to pass?
+    # Actually, we should probably use a middleware for this.
+    # But for now, let's just make sure it doesn't return anything.
+    pass
+
 # --- Handlers ---
 
 @dp.message(F.text.contains("strava"))
 async def link_handler(message: types.Message):
+    logger.info("Triggered link_handler")
     await bot.send_chat_action(message.chat.id, action="upload_document")
     status = await message.reply("🔄 Обрабатываю...")
     
@@ -280,16 +313,143 @@ async def cancel_ride_handler(callback: CallbackQuery):
             reply_markup=None,
             parse_mode="HTML"
         )
-        await callback.answer("Заезд отменен.")
+# ------------------------------------------------------------------
+# /ping — simple connectivity check
+# ------------------------------------------------------------------
+
+@dp.message(Command("ping"))
+async def ping_handler(message: types.Message):
+    logger.info("Triggered ping_handler")
+    await message.reply("🐗 Хрю! Я живой!")
+
+@dp.message(Command("db_check"))
+async def db_check_handler(message: types.Message):
+    logger.info("Triggered db_check_handler")
+    try:
+        async with async_session() as session:
+            await session.execute(select(1))
+        await message.reply("✅ База данных доступна из хендлера!")
+    except Exception as e:
+        logger.error(f"DB check error: {e}")
+        await message.reply(f"❌ Ошибка базы данных: {e}")
+
+
+# ------------------------------------------------------------------
+# /forecast — debug command to trigger weekend weather broadcast
+# ------------------------------------------------------------------
+
+@dp.message(Command("forecast"))
+async def forecast_handler(message: types.Message):
+    """Debug command: immediately generates and sends the weekend weather forecast."""
+    print("DEBUG: Triggered forecast_handler")
+    status = await message.reply("🔄 Собираю прогноз на выходные...")
+    try:
+        msg_text = await send_weekend_weather_broadcast(bot)
+        if msg_text:
+            # Also reply directly to the invoker so they can see the result
+            await status.edit_text("✅ Прогноз отправлен в группу!")
+        else:
+            await status.edit_text(
+                "⚠️ Не удалось сформировать прогноз. "
+                "Проверь TELEGRAM_GROUP_CHAT_ID и OPENWEATHER_API_KEY."
+            )
+    except Exception as e:
+        await status.edit_text(f"❌ Ошибка: {e}")
+
+# ------------------------------------------------------------------
+# /tomorrow — forecast for tomorrow sent to the group
+# ------------------------------------------------------------------
+
+@dp.message(Command("tomorrow"))
+async def tomorrow_handler(message: types.Message):
+    """Fetches tomorrow's forecast and sends it to the group chat."""
+    status = await message.reply("🔄 Смотрю прогноз на завтра...")
+    try:
+        default_location = os.getenv("DEFAULT_LOCATION", "Belgrade")
+        coords = await weather_service.geocode_location(default_location)
+        if not coords:
+            await status.edit_text("❌ Не удалось определить координаты локации.")
+            return
+
+        lat, lon = coords
+        day_data = await weather_service.get_tomorrow_forecast(lat, lon)
+
+        msg_text = UriChanUI.format_tomorrow_message(default_location, day_data)
+
+        if TELEGRAM_GROUP_CHAT_ID:
+            await bot.send_message(int(TELEGRAM_GROUP_CHAT_ID), msg_text, parse_mode="HTML")
+            await status.edit_text("✅ Прогноз на завтра отправлен в группу!")
+        else:
+            # If no group, reply directly
+            await status.edit_text(msg_text, parse_mode="HTML")
+
+    except Exception as e:
+        logger.error(f"Tomorrow handler error: {e}")
+        await status.edit_text(f"❌ Ошибка: {e}")
+
+# ------------------------------------------------------------------
+
+def _is_relay_authorized(user_id: int) -> bool:
+    return user_id in BOT_RELAY_ALLOWED_USERS
+
+async def _relay_to_group(message: types.Message, text: str | None = None):
+    """Forward content from a DM to the group chat."""
+    if not TELEGRAM_GROUP_CHAT_ID:
+        await message.reply("⚠️ TELEGRAM_GROUP_CHAT_ID не настроен.")
+        return
+
+    chat_id = int(TELEGRAM_GROUP_CHAT_ID)
+
+    try:
+        if message.photo:
+            await bot.send_photo(chat_id, photo=message.photo[-1].file_id, caption=message.caption or "", parse_mode="HTML")
+        elif message.document:
+            await bot.send_document(chat_id, document=message.document.file_id, caption=message.caption or "", parse_mode="HTML")
+        elif text:
+            await bot.send_message(chat_id, text, parse_mode="HTML")
+        else:
+            await message.reply("❌ Пустое сообщение, нечего отправлять.")
+            return
+        await message.reply("✅ Отправлено в группу!")
+    except Exception as e:
+        logger.error(f"Relay error: {e}")
+        await message.reply(f"❌ Ошибка отправки: {e}")
+
+@dp.message(Command("relay"))
+async def relay_command_handler(message: types.Message):
+    if message.chat.type != "private" or not _is_relay_authorized(message.from_user.id):
+        return
+    text = message.text.partition(" ")[2].strip() if message.text else ""
+    if not text:
+        await message.reply("Использование: <code>/relay Текст сообщения</code>", parse_mode="HTML")
+        return
+    await _relay_to_group(message, text)
+
+@dp.message(F.chat.type == "private", ~F.text.startswith("/"))
+async def passthrough_dm_handler(message: types.Message):
+    """Relays non-command text and media to the group."""
+    if not _is_relay_authorized(message.from_user.id):
+        return
+
+    if message.photo or message.document:
+        await _relay_to_group(message)
+    elif BOT_RELAY_MODE == "passthrough" and message.text:
+        await _relay_to_group(message, message.text)
+    elif message.text:
+        await message.reply("💡 Используй <code>/relay Текст</code> чтобы отправить сообщение в группу.", parse_mode="HTML")
+
+@dp.message()
+async def catch_all(message: types.Message):
+    logger.info(f"Catch-all triggered for: '{message.text}' from {message.from_user.id}")
 
 async def main():
     await init_db()
-    
-    # Start Scheduler
     scheduler.start()
-    
-    # Start Polling
+    schedule_weekend_weather_job(bot)
+    logger.info("Bot is starting polling...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+

@@ -44,6 +44,22 @@ A Telegram userbot/assistant that unfurls Strava links with rich details, manage
     docker-compose up -d --build
     ```
 
+## Commands
+
+### General
+-   `/ping`: Connectivity check. Bot responds with 🐗.
+-   `/db_check`: Verifies the bot can reach the database at runtime.
+
+### Weather
+-   `/forecast`: Manually trigger the weekend weather broadcast for the group. Posts a detailed Saturday/Sunday forecast with cycling-specific ratings.
+-   `/tomorrow`: Fetches tomorrow's forecast for the default location and posts it to the group. The header adapts to conditions — great, rainy, cold, windy, or bad.
+
+### Bot Relay (Megaphone)
+-   **DM only**, for authorized users:
+-   `/relay <text>`: Forwards the message text to the group chat as the bot.
+-   **Media Relay**: Send a photo or document to the bot; it will be forwarded to the group with the caption.
+-   **Passthrough Mode**: If `BOT_RELAY_MODE=passthrough` is set in `.env`, *any* text sent to the bot (without a command) will be relayed.
+
 ## Usage
 
 1.  Add the bot to your Telegram group (give it "Pin Messages" permission).
